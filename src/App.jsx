@@ -1,207 +1,185 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL
-const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY
-const REFRESH_INTERVAL_MS = 60_000 // 60 seconds — honest cadence, not fake "every second"
-const PAGE_SIZE = 1000 // matches Supabase's default per-request max-rows setting
+const BASE = import.meta.env.VITE_SUPABASE_URL
+const KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY
+const REFRESH_MS = 60_000
+const PAGE = 1000
 
-const RED = '#E8341A'
-const MUTED = '#8A8F9C'
-const GREEN = '#22C55E'
-const AMBER = '#F59E0B'
-const CARD = '#151822'
-const BORDER = '#262A36'
-const CANVAS = '#0B0E14'
-
-// Fetches ONE page (used for bounded queries like "recent history" where
-// we deliberately don't want the whole, ever-growing table).
-async function fetchOnePage(path, rangeEnd = PAGE_SIZE - 1) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      Range: `0-${rangeEnd}`,
-      Prefer: 'count=exact',
-    },
+async function get(path, range, extra = {}) {
+  const res = await fetch(`${BASE}/rest/v1/${path}`, {
+    headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, Range: range, ...extra },
     cache: 'no-store',
   })
-  if (!res.ok) throw new Error(`Supabase request failed (${res.status}): ${path}`)
+  if (!res.ok) throw new Error(`Supabase request failed (${res.status})`)
+  return res
+}
+async function fetchAll(path) {
+  let all = [], off = 0
+  for (;;) {
+    const page = await (await get(path, `${off}-${off + PAGE - 1}`)).json()
+    all = all.concat(page)
+    if (page.length < PAGE) return all
+    off += PAGE
+  }
+}
+async function fetchRecent(path) {
+  const res = await get(path, `0-${PAGE - 1}`, { Prefer: 'count=exact' })
   const rows = await res.json()
-  // Content-Range looks like "0-999/2413" — the number after the slash is
-  // the TRUE total row count in the table, even though we only fetched a page.
-  const contentRange = res.headers.get('content-range')
-  const total = contentRange ? parseInt(contentRange.split('/')[1], 10) || rows.length : rows.length
+  const total = parseInt((res.headers.get('content-range') || '').split('/')[1], 10) || rows.length
   return { rows, total }
 }
 
-// Fetches ALL rows for a table by paging through with the Range header —
-// Supabase/PostgREST caps every single request at 1,000 rows by default,
-// so a plain fetch silently truncates. This loops until a page comes back
-// smaller than a full page, meaning we've reached the end.
-async function fetchAllRows(path) {
-  let allRows = []
-  let offset = 0
-  while (true) {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-      headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        Range: `${offset}-${offset + PAGE_SIZE - 1}`,
-      },
-      cache: 'no-store',
-    })
-    if (!res.ok) throw new Error(`Supabase request failed (${res.status}): ${path}`)
-    const page = await res.json()
-    allRows = allRows.concat(page)
-    if (page.length < PAGE_SIZE) break
-    offset += PAGE_SIZE
-  }
-  return allRows
+function timeAgo(d) {
+  const m = Math.floor((Date.now() - new Date(d).getTime()) / 60000)
+  if (m < 1) return 'just now'
+  if (m < 60) return `${m}m ago`
+  if (m < 1440) return `${Math.floor(m / 60)}h ago`
+  return `${Math.floor(m / 1440)}d ago`
 }
 
-function timeAgo(dateStr) {
-  const diffMs = Date.now() - new Date(dateStr).getTime()
-  const mins = Math.floor(diffMs / 60000)
-  if (mins < 1) return 'just now'
-  if (mins < 60) return `${mins}m ago`
-  const hours = Math.floor(mins / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
+const groupByVariant = (rows) => {
+  const m = {}
+  rows.forEach((r) => (m[r.variant_id] ||= []).push(r))
+  return Object.values(m).map((g) => g.sort((a, b) => new Date(a.changed_at) - new Date(b.changed_at)))
 }
 
-// Turns raw history rows into real detected events (price drop/rise, restock, sellout)
-// by comparing each SKU's consecutive snapshots — skips a SKU's very first-ever
-// record, since that's just "first seen," not an actual change.
-function computeChangeEvents(historyRows) {
-  const byVariant = {}
-  historyRows.forEach((r) => {
-    if (!byVariant[r.variant_id]) byVariant[r.variant_id] = []
-    byVariant[r.variant_id].push(r)
-  })
-
-  const events = []
-  Object.values(byVariant).forEach((rows) => {
-    const sorted = [...rows].sort((a, b) => new Date(a.changed_at) - new Date(b.changed_at))
-    for (let i = 1; i < sorted.length; i++) {
-      const prev = sorted[i - 1]
-      const curr = sorted[i]
-      if (Number(prev.price) !== Number(curr.price)) {
-        events.push({
-          key: `${curr.variant_id}-${curr.changed_at}-price`,
-          type: Number(curr.price) < Number(prev.price) ? 'price_drop' : 'price_rise',
-          product: curr.product_title,
-          variant: curr.variant_title,
-          detail: `£${Number(prev.price).toFixed(2)} → £${Number(curr.price).toFixed(2)}`,
-          changed_at: curr.changed_at,
-        })
-      }
-      if (prev.available !== curr.available) {
-        events.push({
-          key: `${curr.variant_id}-${curr.changed_at}-avail`,
-          type: curr.available ? 'restocked' : 'sold_out',
-          product: curr.product_title,
-          variant: curr.variant_title,
-          detail: curr.available ? 'Back in stock' : 'Sold out',
-          changed_at: curr.changed_at,
-        })
-      }
+function changeEvents(rows) {
+  const ev = []
+  groupByVariant(rows).forEach((g) => {
+    for (let i = 1; i < g.length; i++) {
+      const p = g[i - 1], c = g[i]
+      const base = { pid: c.product_id, product: c.product_title, variant: c.variant_title, at: c.changed_at }
+      if (Number(p.price) !== Number(c.price))
+        ev.push({ ...base, key: `${c.variant_id}${c.changed_at}p`, type: Number(c.price) < Number(p.price) ? 'drop' : 'rise', detail: `£${Number(p.price).toFixed(2)} → £${Number(c.price).toFixed(2)}` })
+      if (p.available !== c.available)
+        ev.push({ ...base, key: `${c.variant_id}${c.changed_at}a`, type: c.available ? 'back' : 'out', detail: c.available ? 'Back in stock' : 'Sold out' })
     }
   })
-
-  return events.sort((a, b) => new Date(b.changed_at) - new Date(a.changed_at))
+  return ev.sort((a, b) => new Date(b.at) - new Date(a.at))
 }
 
-const EVENT_STYLE = {
-  price_drop: { label: '▼ Price drop', color: GREEN },
-  price_rise: { label: '▲ Price increase', color: AMBER },
-  restocked: { label: '● Restocked', color: GREEN },
-  sold_out: { label: '● Sold out', color: RED },
-}
-
-// Real price swings: compares each SKU's EARLIEST vs LATEST recorded price
-// in our tracked window — not fabricated, just first-vs-last from real data.
-function computeBiggestMovers(historyRows) {
-  const byVariant = {}
-  historyRows.forEach((r) => {
-    if (!byVariant[r.variant_id]) byVariant[r.variant_id] = []
-    byVariant[r.variant_id].push(r)
-  })
-  const movers = []
-  Object.values(byVariant).forEach((rows) => {
-    if (rows.length < 2) return
-    const sorted = [...rows].sort((a, b) => new Date(a.changed_at) - new Date(b.changed_at))
-    const first = sorted[0]
-    const last = sorted[sorted.length - 1]
-    const firstPrice = Number(first.price)
-    const lastPrice = Number(last.price)
-    if (firstPrice === lastPrice) return
-    movers.push({
-      variant_id: last.variant_id,
-      product: last.product_title,
-      variant: last.variant_title,
-      firstPrice,
-      lastPrice,
-      pctChange: ((lastPrice - firstPrice) / firstPrice) * 100,
+const biggestMovers = (rows) =>
+  groupByVariant(rows)
+    .filter((g) => g.length > 1)
+    .map((g) => {
+      const f = Number(g[0].price), x = g[g.length - 1], l = Number(x.price)
+      return { id: x.variant_id, product: x.product_title, variant: x.variant_title, f, l, pct: ((l - f) / f) * 100 }
     })
-  })
-  return movers.sort((a, b) => Math.abs(b.pctChange) - Math.abs(a.pctChange)).slice(0, 6)
-}
+    .filter((m) => m.f !== m.l)
+    .sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct))
+    .slice(0, 6)
 
-// Real current-state breakdown by category — straight from product_current,
-// no history involved, so this is always fully accurate.
-function computeCategoryHealth(currentRows) {
-  const byCategory = {}
-  currentRows.forEach((r) => {
-    const cat = r.product_type || 'Uncategorized'
-    if (!byCategory[cat]) byCategory[cat] = { total: 0, available: 0 }
-    byCategory[cat].total += 1
-    if (r.available) byCategory[cat].available += 1
+function categoryHealth(rows) {
+  const m = {}
+  rows.forEach((r) => {
+    const c = r.product_type || 'Uncategorized'
+    m[c] ||= { total: 0, avail: 0 }
+    m[c].total++
+    if (r.available) m[c].avail++
   })
-  return Object.entries(byCategory)
-    .map(([category, { total, available }]) => ({
-      category,
-      total,
-      available,
-      pct: total ? Math.round((available / total) * 100) : 0,
-    }))
+  return Object.entries(m)
+    .map(([name, v]) => ({ name, ...v, pct: Math.round((v.avail / v.total) * 100) }))
     .sort((a, b) => b.total - a.total)
 }
 
-// Real count of detected events per day — shows the pipeline is genuinely
-// live, not just a count we made up.
-function computeDailyActivity(historyRows) {
-  const byDay = {}
-  historyRows.forEach((r) => {
-    const day = r.changed_at.slice(0, 10)
-    byDay[day] = (byDay[day] || 0) + 1
-  })
-  const sortedDays = Object.keys(byDay).sort()
-  const last14 = sortedDays.slice(-14)
-  return last14.map((day) => ({ day: day.slice(5), count: byDay[day] }))
+function dailyActivity(rows) {
+  const m = {}
+  rows.forEach((r) => { const d = r.changed_at.slice(0, 10); m[d] = (m[d] || 0) + 1 })
+  return Object.keys(m).sort().slice(-14).map((d) => ({ day: d.slice(5), n: m[d] }))
+}
+
+const EV = {
+  drop: ['Price drop', 'g'],
+  rise: ['Price increase', 'a'],
+  back: ['Restocked', 'g'],
+  out: ['Sold out', 'r'],
+}
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+:root{--g:#96bd42;--g2:#729b2e;--pale:#edf4dc;--ink:#20241d;--muted:#777d72;--line:#e4e7df;--bg:#f8f8f5;--red:#bd6957;--amber:#a88635}
+body{margin:0;background:var(--bg)}
+.app{font-family:Roboto,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;color:var(--ink);min-height:100vh}
+.shell{max-width:1200px;margin:auto;padding:24px 28px 48px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px}
+.brand{display:flex;align-items:center;gap:10px}
+.mark{width:32px;height:32px;background:#111;border-radius:8px;color:#fff;display:grid;place-items:center;font-weight:700;font-size:16px}
+.word{font-weight:700;font-size:17px;letter-spacing:3px}
+.btn{font:inherit;font-size:13px;font-weight:500;padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);cursor:pointer}
+.btn:hover{border-color:var(--g)}
+.hero{display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:12px;margin-bottom:20px}
+h1{font-size:26px;font-weight:500;margin:0 0 4px}
+.sub{font-size:13px;color:var(--muted)}
+.pill{font-size:11px;font-weight:500;letter-spacing:.5px;color:var(--g2);background:var(--pale);padding:7px 11px;border-radius:99px}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px}
+.kpi{cursor:pointer;text-align:left;font:inherit;color:inherit}
+.kpi:hover,.kpi.on{border-color:var(--g)}
+.lbl{font-size:12px;color:var(--muted)}
+.val{font-size:26px;font-weight:500;margin-top:6px}
+.two{display:grid;grid-template-columns:1.3fr 1fr;gap:14px;margin-bottom:14px}
+.ttl{font-size:15px;font-weight:500;margin-bottom:12px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #eff1ec;font-size:13px}
+.row:last-child{border-bottom:0}
+.click{cursor:pointer}.click:hover{background:#fafbf7}
+.muted{color:var(--muted)}
+.tag{font-size:11px;font-weight:500;padding:3px 8px;border-radius:99px;margin-right:8px;white-space:nowrap}
+.g{background:var(--pale);color:var(--g2)}.r{background:#f7e8e4;color:#a85445}.a{background:#f5eedb;color:var(--amber)}
+.bar{height:6px;background:var(--line);border-radius:99px;overflow:hidden}.bar i{display:block;height:100%}
+.act{display:flex;align-items:flex-end;gap:6px;height:100px}
+.act div{flex:1;text-align:center;font-size:10px;color:var(--muted)}
+.act i{display:block;background:var(--g);border-radius:3px 3px 0 0;margin-bottom:4px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 12px}
+.search{flex:1 1 220px;padding:9px 13px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:13px;outline:none;background:#fff}
+.search:focus{border-color:var(--g)}
+.chip{font:inherit;font-size:12px;font-weight:500;padding:7px 12px;border:1px solid var(--line);border-radius:99px;background:#fff;color:var(--muted);cursor:pointer}
+.chip.on{background:var(--pale);border-color:var(--g);color:var(--g2)}
+.tbl{padding:0;overflow:hidden}
+.th,.tr{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:8px;padding:12px 18px;font-size:13px;align-items:center}
+.th{font-size:12px;color:var(--muted);border-bottom:1px solid var(--line);background:#fbfbf9}
+.th span{cursor:pointer}.th span:hover{color:var(--ink)}
+.tr{border-bottom:1px solid #eff1ec;cursor:pointer}.tr:hover{background:#fafbf7}
+.vars{padding:4px 18px 16px;display:flex;flex-wrap:wrap;gap:6px;border-bottom:1px solid #eff1ec;background:#fafbf7}
+.v{font-size:12px;padding:5px 10px;border-radius:6px;border:1px solid var(--line);background:#fff}
+.v.no{color:#a5aaa0;text-decoration:line-through}
+.v.yes{border-color:var(--g);color:var(--g2)}
+.foot{font-size:11px;color:var(--muted);text-align:center;margin-top:20px;line-height:1.7}
+@media(max-width:760px){.two{grid-template-columns:1fr}.shell{padding:16px 12px 40px}.th,.tr{grid-template-columns:1.6fr 1fr 1fr}.hide{display:none}}
+`
+
+function Shell({ children }) {
+  return (
+    <div className="app">
+      <style>{CSS}</style>
+      <div className="shell">{children}</div>
+    </div>
+  )
 }
 
 export default function App() {
   const [current, setCurrent] = useState([])
   const [history, setHistory] = useState([])
-  const [historyTotal, setHistoryTotal] = useState(0)
+  const [histTotal, setHistTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [lastUpdated, setLastUpdated] = useState(null)
-  const [category, setCategory] = useState('All')
-  const [search, setSearch] = useState('')
+  const [updated, setUpdated] = useState(null)
+  const [cat, setCat] = useState('All')
+  const [stock, setStock] = useState('all')
+  const [q, setQ] = useState('')
+  const [sort, setSort] = useState({ k: 'title', d: 1 })
+  const [open, setOpen] = useState(null)
+  const [limit, setLimit] = useState(50)
+  const tableRef = useRef(null)
+  const feedRef = useRef(null)
 
-  const loadData = useCallback(async () => {
+  const load = useCallback(async () => {
     try {
       setError(null)
-      const [currentRows, historyResult] = await Promise.all([
-        fetchAllRows('product_current?store=eq.allbirds&select=*&order=variant_id'),
-        fetchOnePage('product_history?store=eq.allbirds&select=*&order=changed_at.desc', 999),
+      const [c, h] = await Promise.all([
+        fetchAll('product_current?store=eq.allbirds&select=*&order=variant_id'),
+        fetchRecent('product_history?store=eq.allbirds&select=*&order=changed_at.desc'),
       ])
-      setCurrent(currentRows)
-      setHistory(historyResult.rows)
-      setHistoryTotal(historyResult.total)
-      setLastUpdated(new Date())
+      setCurrent(c); setHistory(h.rows); setHistTotal(h.total); setUpdated(new Date())
     } catch (e) {
       setError(e.message)
     } finally {
@@ -210,340 +188,192 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    loadData()
-    const id = setInterval(loadData, REFRESH_INTERVAL_MS)
+    load()
+    const id = setInterval(load, REFRESH_MS)
     return () => clearInterval(id)
-  }, [loadData])
+  }, [load])
 
-  const categories = useMemo(
-    () => ['All', ...Array.from(new Set(current.map((c) => c.product_type).filter(Boolean)))],
-    [current]
-  )
+  const events = useMemo(() => changeEvents(history), [history])
+  const movers = useMemo(() => biggestMovers(history), [history])
+  const health = useMemo(() => categoryHealth(current), [current])
+  const activity = useMemo(() => dailyActivity(history), [history])
+  const maxAct = Math.max(1, ...activity.map((a) => a.n))
+  const cats = useMemo(() => ['All', ...new Set(current.map((c) => c.product_type).filter(Boolean))], [current])
+
+  const inStock = current.filter((c) => c.available).length
+  const last24 = events.filter((e) => Date.now() - new Date(e.at).getTime() < 864e5).length
 
   const products = useMemo(() => {
-    const byProduct = {}
+    const m = {}
     current.forEach((v) => {
-      if (!byProduct[v.product_id]) {
-        byProduct[v.product_id] = {
-          id: v.product_id,
-          title: v.product_title,
-          vendor: v.vendor,
-          type: v.product_type,
-          prices: [],
-          total: 0,
-          available: 0,
-        }
-      }
-      const p = byProduct[v.product_id]
-      p.prices.push(Number(v.price))
-      p.total += 1
-      if (v.available) p.available += 1
+      const p = (m[v.product_id] ||= { id: v.product_id, title: v.product_title, type: v.product_type, prices: [], vars: [], avail: 0 })
+      p.prices.push(Number(v.price)); p.vars.push(v)
+      if (v.available) p.avail++
     })
-    return Object.values(byProduct)
-      .map((p) => ({
-        ...p,
-        minPrice: Math.min(...p.prices),
-        maxPrice: Math.max(...p.prices),
-      }))
-      .filter((p) => category === 'All' || p.type === category)
-      .filter((p) => p.title.toLowerCase().includes(search.toLowerCase()))
-      .sort((a, b) => a.title.localeCompare(b.title))
-  }, [current, category, search])
+    const cmp = {
+      title: (a, b) => a.title.localeCompare(b.title),
+      price: (a, b) => Math.min(...a.prices) - Math.min(...b.prices),
+      stock: (a, b) => a.avail / a.vars.length - b.avail / b.vars.length,
+    }[sort.k]
+    return Object.values(m)
+      .filter((p) => cat === 'All' || p.type === cat)
+      .filter((p) => stock === 'all' || (stock === 'in' ? p.avail > 0 : p.avail === 0))
+      .filter((p) => p.title.toLowerCase().includes(q.toLowerCase()))
+      .sort((a, b) => cmp(a, b) * sort.d)
+  }, [current, cat, stock, q, sort])
 
-  const kpis = useMemo(() => {
-    const totalSkus = current.length
-    const inStock = current.filter((c) => c.available).length
-    const events = computeChangeEvents(history)
-    const last24h = events.filter(
-      (e) => Date.now() - new Date(e.changed_at).getTime() < 24 * 60 * 60 * 1000
-    ).length
-    return { totalSkus, inStock, outOfStock: totalSkus - inStock, last24h, events }
-  }, [current, history])
+  const jump = (ref) => setTimeout(() => ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+  const sortBy = (k) => setSort((s) => ({ k, d: s.k === k ? -s.d : 1 }))
+  const arrow = (k) => (sort.k === k ? (sort.d === 1 ? ' ↑' : ' ↓') : '')
+  const reset = () => { setCat('All'); setStock('all'); setQ(''); setOpen(null); jump(tableRef) }
+  const focusEvent = (e) => { setCat('All'); setStock('all'); setQ(e.product); setOpen(e.pid); jump(tableRef) }
 
-  const movers = useMemo(() => computeBiggestMovers(history), [history])
-  const categoryHealth = useMemo(() => computeCategoryHealth(current), [current])
-  const dailyActivity = useMemo(() => computeDailyActivity(history), [history])
-  const maxActivity = Math.max(1, ...dailyActivity.map((d) => d.count))
-
-  if (loading) {
-    return (
-      <Shell>
-        <div style={{ color: MUTED, textAlign: 'center', padding: '80px 20px' }}>
-          Loading live inventory data…
-        </div>
-      </Shell>
-    )
-  }
-
-  if (error) {
-    return (
-      <Shell>
-        <div style={{ color: RED, textAlign: 'center', padding: '80px 20px', maxWidth: 500, margin: '0 auto' }}>
-          <div style={{ fontWeight: 700, marginBottom: 8 }}>Couldn't load live data</div>
-          <div style={{ fontSize: 13, color: MUTED }}>{error}</div>
-          <div style={{ fontSize: 12, color: MUTED, marginTop: 16 }}>
-            Check that VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY are set correctly,
-            and that Row Level Security allows public read access on these tables.
-          </div>
-        </div>
-      </Shell>
-    )
-  }
-
-  return (
+  if (loading) return <Shell><p className="muted" style={{ textAlign: 'center', padding: 80 }}>Loading live inventory data…</p></Shell>
+  if (error) return (
     <Shell>
-      {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 14, marginBottom: 24 }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 4 }}>
-            <div style={{ width: 22, height: 22, borderRadius: 6, background: RED }} />
-            <span style={{ fontWeight: 700, fontSize: 18, letterSpacing: '-0.01em', color: '#fff' }}>
-              Allbirds — Live Inventory
-            </span>
-          </div>
-          <div style={{ fontSize: 12.5, color: MUTED }}>
-            Built by EMIMO · real Shopify data, auto-refreshing every 60 seconds
-          </div>
-        </div>
-        <div style={{ textAlign: 'right' }}>
-          <button
-            onClick={loadData}
-            style={{
-              padding: '7px 14px', borderRadius: 100, fontSize: 12.5, fontWeight: 600,
-              border: `1px solid ${BORDER}`, background: CARD, color: '#fff', cursor: 'pointer',
-            }}
-          >
-            Refresh now
-          </button>
-          {lastUpdated && (
-            <div style={{ fontSize: 11, color: MUTED, marginTop: 6, fontFamily: 'JetBrains Mono, monospace' }}>
-              Updated {timeAgo(lastUpdated)}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* KPI row */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 16 }}>
-        {[
-          { label: 'SKUs Tracked', val: kpis.totalSkus.toLocaleString() },
-          { label: 'In Stock', val: kpis.inStock.toLocaleString() },
-          { label: 'Out of Stock', val: kpis.outOfStock.toLocaleString(), warn: kpis.outOfStock > 0 },
-          { label: 'Changes (24h)', val: kpis.last24h.toLocaleString() },
-        ].map((k, i) => (
-          <div key={i} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 16 }}>
-            <div style={{ fontSize: 11, color: MUTED, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.03em', marginBottom: 8 }}>
-              {k.label}
-            </div>
-            <div style={{ fontSize: 24, fontWeight: 800, color: k.warn ? RED : '#fff' }}>{k.val}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Biggest movers + category health */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: 12, marginBottom: 16 }}>
-        <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 18 }}>
-          <div style={{ fontSize: 13.5, fontWeight: 700, color: '#fff', marginBottom: 10 }}>
-            Biggest Movers
-          </div>
-          {movers.length === 0 && (
-            <div style={{ fontSize: 12.5, color: MUTED }}>
-              No repeated price changes tracked yet for any SKU.
-            </div>
-          )}
-          {movers.map((m) => (
-            <div
-              key={m.variant_id}
-              style={{
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                padding: '8px 0', borderBottom: `1px solid ${BORDER}`, fontSize: 12.5,
-              }}
-            >
-              <div style={{ maxWidth: '60%' }}>
-                <div style={{ color: '#fff', fontWeight: 600 }}>{m.product}</div>
-                <div style={{ color: MUTED, fontSize: 11 }}>{m.variant}</div>
-              </div>
-              <div style={{ textAlign: 'right' }}>
-                <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 11, color: MUTED }}>
-                  £{m.firstPrice.toFixed(2)} → £{m.lastPrice.toFixed(2)}
-                </div>
-                <div style={{ fontWeight: 700, color: m.pctChange < 0 ? GREEN : AMBER }}>
-                  {m.pctChange > 0 ? '+' : ''}{m.pctChange.toFixed(1)}%
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 18 }}>
-          <div style={{ fontSize: 13.5, fontWeight: 700, color: '#fff', marginBottom: 12 }}>
-            Category Stock Health
-          </div>
-          {categoryHealth.map((c) => (
-            <div key={c.category} style={{ marginBottom: 12 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 5 }}>
-                <span style={{ color: '#fff' }}>{c.category}</span>
-                <span style={{ color: MUTED }}>{c.available}/{c.total} ({c.pct}%)</span>
-              </div>
-              <div style={{ background: BORDER, borderRadius: 100, height: 6, overflow: 'hidden' }}>
-                <div
-                  style={{
-                    width: `${c.pct}%`, height: '100%',
-                    background: c.pct >= 70 ? GREEN : c.pct >= 30 ? AMBER : RED,
-                  }}
-                />
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Recently changed feed */}
-      <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 18, marginBottom: 16 }}>
-        <div style={{ fontSize: 13.5, fontWeight: 700, color: '#fff', marginBottom: 10 }}>
-          Recently Changed
-        </div>
-        {kpis.events.length === 0 && (
-          <div style={{ fontSize: 12.5, color: MUTED }}>
-            No changes detected yet — check back after a few more refresh cycles. This feed only
-            shows real price/stock changes, not first-time sightings.
-          </div>
-        )}
-        {kpis.events.slice(0, 12).map((e) => {
-          const style = EVENT_STYLE[e.type]
-          return (
-            <div
-              key={e.key}
-              style={{
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                padding: '9px 0', borderBottom: `1px solid ${BORDER}`, fontSize: 12.5,
-              }}
-            >
-              <div>
-                <span style={{ color: style.color, fontWeight: 700, marginRight: 8 }}>{style.label}</span>
-                <span style={{ color: '#fff' }}>{e.product}</span>
-                <span style={{ color: MUTED }}> — {e.variant}</span>
-              </div>
-              <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-                <span style={{ color: MUTED, fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }}>{e.detail}</span>
-                <span style={{ color: MUTED, fontSize: 11 }}>{timeAgo(e.changed_at)}</span>
-              </div>
-            </div>
-          )
-        })}
-      </div>
-
-      {/* Change activity over time */}
-      <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, padding: '18px 18px 14px', marginBottom: 16 }}>
-        <div style={{ fontSize: 13.5, fontWeight: 700, color: '#fff', marginBottom: 14 }}>
-          Change Activity — Last {dailyActivity.length} Days
-        </div>
-        {dailyActivity.length === 0 ? (
-          <div style={{ fontSize: 12.5, color: MUTED }}>Not enough history yet to chart activity.</div>
-        ) : (
-          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6, height: 90 }}>
-            {dailyActivity.map((d) => (
-              <div key={d.day} style={{ flex: 1, textAlign: 'center' }}>
-                <div
-                  title={`${d.count} changes on ${d.day}`}
-                  style={{
-                    height: `${Math.max(6, (d.count / maxActivity) * 70)}px`,
-                    background: RED, opacity: 0.85, borderRadius: '3px 3px 0 0',
-                  }}
-                />
-                <div style={{ fontSize: 9.5, color: MUTED, marginTop: 4, fontFamily: 'JetBrains Mono, monospace' }}>
-                  {d.day}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Filters */}
-      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
-        <input
-          placeholder="Search products…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          style={{
-            flex: '1 1 200px', padding: '9px 14px', borderRadius: 10, border: `1px solid ${BORDER}`,
-            background: CARD, color: '#fff', fontSize: 13, outline: 'none',
-          }}
-        />
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-          {categories.map((c) => (
-            <button
-              key={c}
-              onClick={() => setCategory(c)}
-              style={{
-                padding: '8px 13px', borderRadius: 100, fontSize: 12, fontWeight: 600,
-                border: `1px solid ${category === c ? RED : BORDER}`,
-                background: category === c ? '#2A1512' : CARD,
-                color: category === c ? RED : MUTED, cursor: 'pointer',
-              }}
-            >
-              {c}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Product table */}
-      <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, overflow: 'hidden' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr', padding: '12px 18px', fontSize: 11, fontWeight: 700, color: MUTED, textTransform: 'uppercase', letterSpacing: '0.03em', borderBottom: `1px solid ${BORDER}` }}>
-          <div>Product</div>
-          <div>Type</div>
-          <div>Price Range</div>
-          <div>Availability</div>
-        </div>
-        {products.length === 0 && (
-          <div style={{ padding: 20, fontSize: 13, color: MUTED, textAlign: 'center' }}>
-            No products match this filter.
-          </div>
-        )}
-        {products.slice(0, 50).map((p) => (
-          <div
-            key={p.id}
-            style={{
-              display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr', padding: '12px 18px',
-              fontSize: 13, borderBottom: `1px solid ${BORDER}`, alignItems: 'center',
-            }}
-          >
-            <div style={{ color: '#fff', fontWeight: 600 }}>{p.title}</div>
-            <div style={{ color: MUTED }}>{p.type || '—'}</div>
-            <div style={{ color: '#fff', fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }}>
-              {p.minPrice === p.maxPrice ? `£${p.minPrice}` : `£${p.minPrice}–${p.maxPrice}`}
-            </div>
-            <div>
-              <span style={{
-                fontSize: 11, fontWeight: 700, padding: '3px 9px', borderRadius: 100,
-                background: p.available === p.total ? '#122A1A' : p.available === 0 ? '#2A1512' : '#2A2412',
-                color: p.available === p.total ? GREEN : p.available === 0 ? RED : AMBER,
-              }}>
-                {p.available}/{p.total} in stock
-              </span>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ fontSize: 11, color: MUTED, textAlign: 'center', marginTop: 20 }}>
-        Live data from Allbirds' public product feed, tracked by an automated pipeline running
-        every 15 minutes. This dashboard refreshes itself — no manual reload needed.
-      </div>
-      <div style={{ fontSize: 10.5, color: MUTED, textAlign: 'center', marginTop: 6, fontFamily: 'JetBrains Mono, monospace' }}>
-        product_current: {current.length.toLocaleString()} rows (full table) · product_history:{' '}
-        {historyTotal.toLocaleString()} total events logged, showing most recent {history.length.toLocaleString()}
+      <div style={{ textAlign: 'center', padding: 80 }}>
+        <b style={{ color: 'var(--red)' }}>Couldn't load live data</b>
+        <p className="sub">{error}</p>
+        <p className="sub">Check the two VITE_SUPABASE variables and that public read access is enabled on the tables.</p>
       </div>
     </Shell>
   )
-}
 
-function Shell({ children }) {
+  const kpis = [
+    { l: 'SKUs tracked', v: current.length, f: reset, on: stock === 'all' && cat === 'All' && !q },
+    { l: 'In stock', v: inStock, f: () => { setStock('in'); jump(tableRef) }, on: stock === 'in' },
+    { l: 'Out of stock', v: current.length - inStock, f: () => { setStock('out'); jump(tableRef) }, on: stock === 'out', red: true },
+    { l: 'Changes (24h)', v: last24, f: () => jump(feedRef) },
+  ]
+
   return (
-    <div style={{ background: CANVAS, minHeight: '100vh', padding: '28px 16px 60px' }}>
-      <div style={{ maxWidth: 980, margin: '0 auto' }}>{children}</div>
-    </div>
+    <Shell>
+      <div className="top">
+        <div className="brand"><div className="mark">E</div><div className="word">EMIMO</div></div>
+        <div style={{ textAlign: 'right' }}>
+          <button className="btn" onClick={load}>Refresh now</button>
+          {updated && <div className="sub" style={{ marginTop: 5, fontSize: 11 }}>Updated {timeAgo(updated)}</div>}
+        </div>
+      </div>
+
+      <div className="hero">
+        <div>
+          <h1>Allbirds — Live inventory</h1>
+          <div className="sub">Real Shopify data, tracked automatically and refreshed every 60 seconds.</div>
+        </div>
+        <div className="pill">LIVE DATA · SHOPIFY</div>
+      </div>
+
+      <div className="kpis">
+        {kpis.map((k) => (
+          <button key={k.l} className={`card kpi ${k.on ? 'on' : ''}`} onClick={k.f}>
+            <div className="lbl">{k.l}</div>
+            <div className="val" style={k.red ? { color: 'var(--red)' } : null}>{k.v.toLocaleString()}</div>
+          </button>
+        ))}
+      </div>
+
+      <div className="two">
+        <div className="card">
+          <div className="ttl">Biggest movers</div>
+          {!movers.length && <div className="sub">No repeated price changes tracked yet.</div>}
+          {movers.map((m) => (
+            <div className="row" key={m.id}>
+              <div><b style={{ fontWeight: 500 }}>{m.product}</b><div className="sub">{m.variant}</div></div>
+              <div style={{ textAlign: 'right' }}>
+                <div className="sub">£{m.f.toFixed(2)} → £{m.l.toFixed(2)}</div>
+                <b style={{ color: m.pct < 0 ? 'var(--g2)' : 'var(--amber)' }}>{m.pct > 0 ? '+' : ''}{m.pct.toFixed(1)}%</b>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="card">
+          <div className="ttl">Category stock health</div>
+          {health.map((c) => (
+            <div key={c.name} style={{ marginBottom: 12, cursor: 'pointer' }} onClick={() => { setCat(c.name); jump(tableRef) }}>
+              <div className="row" style={{ padding: '0 0 5px', border: 0 }}>
+                <span>{c.name}</span><span className="muted">{c.avail}/{c.total} ({c.pct}%)</span>
+              </div>
+              <div className="bar"><i style={{ width: `${c.pct}%`, background: c.pct >= 70 ? 'var(--g)' : c.pct >= 30 ? 'var(--amber)' : 'var(--red)' }} /></div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="card" ref={feedRef} style={{ marginBottom: 14 }}>
+        <div className="ttl">Recently changed</div>
+        {!events.length && <div className="sub">No changes detected yet — this only shows real price and stock changes.</div>}
+        {events.slice(0, 12).map((e) => (
+          <div className="row click" key={e.key} onClick={() => focusEvent(e)}>
+            <div><span className={`tag ${EV[e.type][1]}`}>{EV[e.type][0]}</span>{e.product}<span className="muted"> — {e.variant}</span></div>
+            <div className="muted" style={{ whiteSpace: 'nowrap' }}>{e.detail} · {timeAgo(e.at)}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="card" style={{ marginBottom: 6 }}>
+        <div className="ttl">Change activity — last {activity.length} days</div>
+        {activity.length ? (
+          <div className="act">
+            {activity.map((a) => (
+              <div key={a.day} title={`${a.n} changes`}>
+                <i style={{ height: Math.max(6, (a.n / maxAct) * 70) }} />{a.day}
+              </div>
+            ))}
+          </div>
+        ) : <div className="sub">Not enough history yet.</div>}
+      </div>
+
+      <div ref={tableRef} className="filters">
+        <input className="search" placeholder="Search products…" value={q} onChange={(e) => setQ(e.target.value)} />
+        {[['all', 'All'], ['in', 'Has stock'], ['out', 'Sold out']].map(([k, l]) => (
+          <button key={k} className={`chip ${stock === k ? 'on' : ''}`} onClick={() => setStock(k)}>{l}</button>
+        ))}
+      </div>
+      <div className="filters" style={{ marginTop: 0 }}>
+        {cats.map((c) => <button key={c} className={`chip ${cat === c ? 'on' : ''}`} onClick={() => setCat(c)}>{c}</button>)}
+      </div>
+
+      <div className="card tbl">
+        <div className="th">
+          <span onClick={() => sortBy('title')}>Product{arrow('title')}</span>
+          <span className="hide">Type</span>
+          <span onClick={() => sortBy('price')}>Price{arrow('price')}</span>
+          <span onClick={() => sortBy('stock')}>Availability{arrow('stock')}</span>
+        </div>
+        {!products.length && <div className="sub" style={{ padding: 20, textAlign: 'center' }}>No products match this filter.</div>}
+        {products.slice(0, limit).map((p) => {
+          const lo = Math.min(...p.prices), hi = Math.max(...p.prices)
+          const cls = p.avail === p.vars.length ? 'g' : p.avail === 0 ? 'r' : 'a'
+          return (
+            <div key={p.id}>
+              <div className="tr" onClick={() => setOpen(open === p.id ? null : p.id)}>
+                <b style={{ fontWeight: 500 }}>{p.title}</b>
+                <span className="muted hide">{p.type || '—'}</span>
+                <span>{lo === hi ? `£${lo}` : `£${lo}–${hi}`}</span>
+                <span><span className={`tag ${cls}`}>{p.avail}/{p.vars.length} in stock</span></span>
+              </div>
+              {open === p.id && (
+                <div className="vars">
+                  {[...p.vars]
+                    .sort((a, b) => parseFloat(a.variant_title) - parseFloat(b.variant_title) || String(a.variant_title).localeCompare(b.variant_title))
+                    .map((v) => <span key={v.variant_id} className={`v ${v.available ? 'yes' : 'no'}`}>{v.variant_title}</span>)}
+                </div>
+              )}
+            </div>
+          )
+        })}
+        {products.length > limit && (
+          <div style={{ padding: 14, textAlign: 'center' }}>
+            <button className="btn" onClick={() => setLimit(limit + 50)}>Show 50 more ({products.length - limit} left)</button>
+          </div>
+        )}
+      </div>
+
+      <div className="foot">
+        Data from Allbirds' public product feed, collected by an automated pipeline every 15 minutes.<br />
+        {current.length.toLocaleString()} SKUs in the current table · {histTotal.toLocaleString()} change events logged
+      </div>
+    </Shell>
   )
 }
